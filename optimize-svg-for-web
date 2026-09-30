@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+import argparse
+import base64
+import binascii
+import html
+import re
+import sys
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from urllib.parse import quote
+
+
+SVG_NS = "http://www.w3.org/2000/svg"
+XLINK_NS = "http://www.w3.org/1999/xlink"
+PNG_DATA_URI = "data:image/png;base64,"
+
+
+def local_name(tag):
+    return tag.rsplit("}", 1)[-1] if tag.startswith("{") else tag
+
+
+def normalize_number(value):
+    if value is None:
+        return None
+
+    match = re.fullmatch(r"([+-]?(?:\d+(?:\.\d*)?|\.\d+))(?:px)?", value.strip())
+    if not match:
+        return value.strip()
+
+    number = match.group(1)
+    if "." not in number:
+        return number
+
+    normalized = number.rstrip("0").rstrip(".")
+    return normalized or "0"
+
+
+def safe_asset_name(stem, suffix):
+    safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "-", stem).strip(".-")
+    return f"{safe_stem or 'image'}{suffix.lower()}"
+
+
+def href_for_svg(relative_path):
+    return quote(relative_path.as_posix(), safe="/._-~")
+
+
+def decode_embedded_png(href):
+    if not href.startswith(PNG_DATA_URI):
+        return None
+
+    try:
+        return base64.b64decode(href[len(PNG_DATA_URI):], validate=True)
+    except binascii.Error as error:
+        raise ValueError(f"invalid embedded PNG data: {error}") from error
+
+
+def get_href(element):
+    return element.attrib.get("href") or element.attrib.get(f"{{{XLINK_NS}}}href")
+
+
+def find_image(root):
+    for element in root.iter():
+        if local_name(element.tag) == "image":
+            return element
+    raise ValueError("missing SVG image element")
+
+
+def svg_dimensions(root, image):
+    width = normalize_number(root.attrib.get("width") or image.attrib.get("width"))
+    height = normalize_number(root.attrib.get("height") or image.attrib.get("height"))
+    view_box = root.attrib.get("viewBox")
+
+    if not width or not height:
+        raise ValueError("missing width or height")
+
+    return width, height, view_box or f"0 0 {width} {height}"
+
+
+def minified_svg(width, height, view_box, href, title=None):
+    title_markup = ""
+    if title:
+        title_markup = f"<title>{html.escape(title, quote=False)}</title>"
+
+    return (
+        f'<svg xmlns="{SVG_NS}" width="{html.escape(width, quote=True)}" '
+        f'height="{html.escape(height, quote=True)}" '
+        f'viewBox="{html.escape(view_box, quote=True)}">'
+        f"{title_markup}"
+        f'<image width="{html.escape(width, quote=True)}" '
+        f'height="{html.escape(height, quote=True)}" '
+        f'href="{html.escape(href, quote=True)}" '
+        f'preserveAspectRatio="none"/></svg>\n'
+    )
+
+
+def optimize_svg(source, output_dir, asset_dir_name, inline, keep_title):
+    text = source.read_text(encoding="utf-8")
+    root = ET.fromstring(text)
+
+    if local_name(root.tag) != "svg":
+        raise ValueError("not an SVG document")
+
+    image = find_image(root)
+    width, height, view_box = svg_dimensions(root, image)
+    href = get_href(image)
+
+    if not href:
+        raise ValueError("missing image href")
+
+    title = None
+    if keep_title:
+        for element in root:
+            if local_name(element.tag) == "title":
+                title = "".join(element.itertext()).strip() or None
+                break
+
+    if not inline:
+        data = decode_embedded_png(href)
+        if data is not None:
+            asset_dir = output_dir / asset_dir_name
+            asset_dir.mkdir(parents=True, exist_ok=True)
+            asset_name = safe_asset_name(source.stem, ".png")
+            asset_path = asset_dir / asset_name
+            asset_path.write_bytes(data)
+            href = href_for_svg(Path(asset_dir_name) / asset_name)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    target = output_dir / source.name
+    target.write_text(minified_svg(width, height, view_box, href, title), encoding="utf-8")
+    return target
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Optimize generated PNG-wrapper SVG files for web pages."
+    )
+    parser.add_argument("input_dir", type=Path)
+    parser.add_argument("output_dir", type=Path)
+    parser.add_argument(
+        "--asset-dir",
+        default="assets",
+        help="asset folder to create inside output_dir when externalizing PNGs",
+    )
+    parser.add_argument(
+        "--inline",
+        action="store_true",
+        help="keep embedded PNG data in each SVG and only minify the wrapper",
+    )
+    parser.add_argument(
+        "--keep-title",
+        action="store_true",
+        help="preserve the generated title element",
+    )
+    args = parser.parse_args()
+
+    if not args.input_dir.is_dir():
+        print(f"Input directory does not exist: {args.input_dir}", file=sys.stderr)
+        return 1
+
+    sources = sorted(
+        path for path in args.input_dir.iterdir()
+        if path.is_file() and path.suffix.lower() == ".svg"
+    )
+
+    if not sources:
+        print(f"No SVG files found in {args.input_dir}")
+        return 0
+
+    optimized = 0
+    failed = 0
+
+    for source in sources:
+        try:
+            target = optimize_svg(
+                source,
+                args.output_dir,
+                args.asset_dir,
+                args.inline,
+                args.keep_title,
+            )
+        except Exception as error:
+            failed += 1
+            print(f"Failed: {source.name}: {error}", file=sys.stderr)
+            continue
+
+        optimized += 1
+        print(f"Optimized: {source.name} -> {target.name}")
+
+    print(f"Done. Optimized {optimized} SVG file(s).")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

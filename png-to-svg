@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+import argparse
+import base64
+import html
+import struct
+import sys
+from pathlib import Path
+
+
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+
+def png_size(data):
+    if not data.startswith(PNG_SIGNATURE):
+        raise ValueError("not a PNG file")
+
+    if data[12:16] != b"IHDR":
+        raise ValueError("missing PNG IHDR chunk")
+
+    return struct.unpack(">II", data[16:24])
+
+
+def convert_png(source, output_dir):
+    data = source.read_bytes()
+    width, height = png_size(data)
+    encoded = base64.b64encode(data).decode("ascii")
+    title = html.escape(source.stem)
+
+    svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">
+  <title>{title}</title>
+  <image width="{width}" height="{height}" href="data:image/png;base64,{encoded}" preserveAspectRatio="none"/>
+</svg>
+'''
+
+    target = output_dir / f"{source.stem}.svg"
+    target.write_text(svg, encoding="utf-8")
+    return target
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Convert all PNG files in an input directory to SVG files."
+    )
+    parser.add_argument("input_dir", type=Path)
+    parser.add_argument("output_dir", type=Path)
+    args = parser.parse_args()
+
+    if not args.input_dir.is_dir():
+        print(f"Input directory does not exist: {args.input_dir}", file=sys.stderr)
+        return 1
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    sources = sorted(
+        path for path in args.input_dir.iterdir()
+        if path.is_file() and path.suffix.lower() == ".png"
+    )
+
+    if not sources:
+        print(f"No PNG files found in {args.input_dir}")
+        return 0
+
+    converted = 0
+    failed = 0
+
+    for source in sources:
+        try:
+            target = convert_png(source, args.output_dir)
+        except Exception as error:
+            failed += 1
+            print(f"Failed: {source.name}: {error}", file=sys.stderr)
+            continue
+
+        converted += 1
+        print(f"Converted: {source.name} -> {target.name}")
+
+    print(f"Done. Converted {converted} PNG file(s).")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
